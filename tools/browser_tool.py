@@ -66,6 +66,7 @@ from typing import Dict, Any, Optional, List
 from pathlib import Path
 from agent.auxiliary_client import call_llm
 from hermes_constants import get_hermes_home
+from tools.browser_bridge_state import get_browser_bridge_cdp_url
 
 try:
     from tools.website_policy import check_website_access
@@ -222,7 +223,10 @@ def _get_cdp_override() -> str:
     both Browserbase and the local headless launcher and connect directly to
     the supplied Chrome DevTools Protocol endpoint.
     """
-    return _resolve_cdp_override(os.environ.get("BROWSER_CDP_URL", ""))
+    env_override = os.environ.get("BROWSER_CDP_URL", "")
+    if env_override.strip():
+        return _resolve_cdp_override(env_override)
+    return _resolve_cdp_override(get_browser_bridge_cdp_url())
 
 
 # ============================================================================

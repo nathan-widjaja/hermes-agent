@@ -6,6 +6,7 @@ handling without requiring a running terminal environment.
 
 import json
 import logging
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from tools.file_tools import (
@@ -311,4 +312,54 @@ class TestSearchHints:
         assert "offset=100" in raw
 
 
+class TestFileOpsEnvironmentParity:
+    def test_file_tools_preserve_docker_cwd_mount_setting(self, monkeypatch):
+        import tools.file_tools as file_tools
+        import tools.terminal_tool as terminal_tool
 
+        task_id = "docker-mount-parity"
+        created = {}
+
+        config = {
+            "env_type": "docker",
+            "docker_image": "nikolaik/python-nodejs:python3.11-nodejs20",
+            "cwd": "/workspace",
+            "host_cwd": "/Users/nathan/.hermes/workspaces/openclaw-staging",
+            "timeout": 300,
+            "container_cpu": 1,
+            "container_memory": 5120,
+            "container_disk": 51200,
+            "container_persistent": True,
+            "modal_mode": "auto",
+            "docker_volumes": [],
+            "docker_mount_cwd_to_workspace": True,
+        }
+
+        def fake_create_environment(**kwargs):
+            created.update(kwargs)
+            return SimpleNamespace(cwd=kwargs["cwd"])
+
+        monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: config)
+        monkeypatch.setattr(terminal_tool, "_create_environment", fake_create_environment)
+        monkeypatch.setattr(terminal_tool, "_start_cleanup_thread", lambda: None)
+
+        file_tools.clear_file_ops_cache(task_id)
+        with terminal_tool._env_lock:
+            terminal_tool._active_environments.pop(task_id, None)
+            terminal_tool._last_activity.pop(task_id, None)
+        with terminal_tool._creation_locks_lock:
+            terminal_tool._creation_locks.pop(task_id, None)
+
+        try:
+            ops = file_tools._get_file_ops(task_id)
+            assert isinstance(ops, file_tools.ShellFileOperations)
+            assert created["host_cwd"] == config["host_cwd"]
+            assert created["container_config"]["docker_mount_cwd_to_workspace"] is True
+            assert created["container_config"]["modal_mode"] == "auto"
+        finally:
+            file_tools.clear_file_ops_cache(task_id)
+            with terminal_tool._env_lock:
+                terminal_tool._active_environments.pop(task_id, None)
+                terminal_tool._last_activity.pop(task_id, None)
+            with terminal_tool._creation_locks_lock:
+                terminal_tool._creation_locks.pop(task_id, None)

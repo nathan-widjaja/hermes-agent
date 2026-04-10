@@ -46,6 +46,18 @@ class TestResolveCdpOverride:
         with patch("tools.browser_tool.requests.get", side_effect=RuntimeError("boom")):
             assert _resolve_cdp_override(HTTP_URL) == HTTP_URL
 
+    def test_uses_persisted_bridge_state_when_env_is_empty(self, monkeypatch):
+        import tools.browser_tool as browser_tool
+
+        monkeypatch.delenv("BROWSER_CDP_URL", raising=False)
+        monkeypatch.setattr(
+            browser_tool,
+            "get_browser_bridge_cdp_url",
+            lambda: "ws://127.0.0.1:9222/devtools/browser/persisted",
+        )
+
+        assert browser_tool._get_cdp_override() == "ws://127.0.0.1:9222/devtools/browser/persisted"
+
     def test_normalizes_provider_returned_http_cdp_url_when_creating_session(self, monkeypatch):
         import tools.browser_tool as browser_tool
 

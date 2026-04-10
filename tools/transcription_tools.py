@@ -96,12 +96,34 @@ _local_model_name: Optional[str] = None
 def get_stt_model_from_config() -> Optional[str]:
     """Read the STT model name from ~/.hermes/config.yaml.
 
-    Returns the value of ``stt.model`` if present, otherwise ``None``.
+    Returns the provider-appropriate model setting when an explicit provider is
+    configured, otherwise falls back to the legacy top-level ``stt.model``.
     Silently returns ``None`` on any error (missing file, bad YAML, etc.).
     """
     try:
         from hermes_cli.config import read_raw_config
-        return read_raw_config().get("stt", {}).get("model")
+        stt_config = read_raw_config().get("stt", {})
+        if not isinstance(stt_config, dict):
+            return None
+
+        provider = stt_config.get("provider")
+        if provider in ("local", "local_command"):
+            local_cfg = stt_config.get("local", {})
+            local_model = local_cfg.get("model") if isinstance(local_cfg, dict) else None
+            if local_model:
+                return _normalize_local_command_model(local_model)
+            legacy_model = stt_config.get("model")
+            return _normalize_local_command_model(legacy_model) if legacy_model else None
+        if provider == "openai":
+            openai_cfg = stt_config.get("openai", {})
+            return (openai_cfg.get("model") if isinstance(openai_cfg, dict) else None) or stt_config.get("model")
+        if provider == "groq":
+            groq_cfg = stt_config.get("groq", {})
+            return (groq_cfg.get("model") if isinstance(groq_cfg, dict) else None) or stt_config.get("model")
+        if provider == "mistral":
+            mistral_cfg = stt_config.get("mistral", {})
+            return (mistral_cfg.get("model") if isinstance(mistral_cfg, dict) else None) or stt_config.get("model")
+        return stt_config.get("model")
     except Exception:
         pass
     return None
@@ -611,7 +633,9 @@ def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, A
 
     if provider == "local":
         local_cfg = stt_config.get("local", {})
-        model_name = model or local_cfg.get("model", DEFAULT_LOCAL_MODEL)
+        model_name = _normalize_local_command_model(
+            model or local_cfg.get("model", DEFAULT_LOCAL_MODEL)
+        )
         return _transcribe_local(file_path, model_name)
 
     if provider == "local_command":
