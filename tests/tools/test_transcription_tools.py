@@ -784,6 +784,16 @@ class TestTranscribeAudioDispatch:
 
         assert mock_local.call_args[0][1] == "large-v3"
 
+    def test_openai_model_override_is_normalized_for_local(self, sample_ogg):
+        with patch("tools.transcription_tools._load_stt_config", return_value={}), \
+             patch("tools.transcription_tools._get_provider", return_value="local"), \
+             patch("tools.transcription_tools._transcribe_local",
+                   return_value={"success": True, "transcript": "hi"}) as mock_local:
+            from tools.transcription_tools import transcribe_audio
+            transcribe_audio(sample_ogg, model="whisper-1")
+
+        assert mock_local.call_args[0][1] == "base"
+
     def test_default_model_used_when_none(self, sample_ogg):
         with patch("tools.transcription_tools._load_stt_config", return_value={}), \
              patch("tools.transcription_tools._get_provider", return_value="groq"), \
@@ -859,6 +869,32 @@ class TestGetSttModelFromConfig:
 
         from tools.transcription_tools import get_stt_model_from_config
         assert get_stt_model_from_config() is None
+
+    def test_prefers_local_model_for_explicit_local_provider(self, tmp_path, monkeypatch):
+        cfg = tmp_path / "config.yaml"
+        cfg.write_text(
+            "stt:\n"
+            "  provider: local\n"
+            "  model: whisper-1\n"
+            "  local:\n"
+            "    model: tiny\n"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+        from tools.transcription_tools import get_stt_model_from_config
+        assert get_stt_model_from_config() == "tiny"
+
+    def test_normalizes_legacy_model_for_explicit_local_provider(self, tmp_path, monkeypatch):
+        cfg = tmp_path / "config.yaml"
+        cfg.write_text(
+            "stt:\n"
+            "  provider: local\n"
+            "  model: whisper-1\n"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+        from tools.transcription_tools import get_stt_model_from_config
+        assert get_stt_model_from_config() == "base"
 
 
 # ============================================================================

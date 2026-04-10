@@ -536,6 +536,13 @@ class TelegramAdapter(BasePlatformAdapter):
             
             # Register handlers
             self._app.add_handler(TelegramMessageHandler(
+                filters.PHOTO | filters.VIDEO | filters.AUDIO | filters.VOICE | filters.Document.ALL | filters.Sticker.ALL,
+                self._handle_media_message
+            ))
+            # Register media before plain text because some Telegram clients
+            # attach both `voice` media and a transcribed `text` field to the
+            # same update. If text wins first, STT never sees the voice note.
+            self._app.add_handler(TelegramMessageHandler(
                 filters.TEXT & ~filters.COMMAND,
                 self._handle_text_message
             ))
@@ -546,10 +553,6 @@ class TelegramAdapter(BasePlatformAdapter):
             self._app.add_handler(TelegramMessageHandler(
                 filters.LOCATION | getattr(filters, "VENUE", filters.LOCATION),
                 self._handle_location_message
-            ))
-            self._app.add_handler(TelegramMessageHandler(
-                filters.PHOTO | filters.VIDEO | filters.AUDIO | filters.VOICE | filters.Document.ALL | filters.Sticker.ALL,
-                self._handle_media_message
             ))
             # Handle inline keyboard button callbacks (update prompts)
             self._app.add_handler(CallbackQueryHandler(self._handle_callback_query))

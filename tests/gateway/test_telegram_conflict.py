@@ -63,6 +63,57 @@ async def test_connect_rejects_same_host_token_lock(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_connect_registers_media_handler_before_text(monkeypatch):
+    """Voice notes with Telegram-side transcript text must reach the media path first."""
+    adapter = TelegramAdapter(PlatformConfig(enabled=True, token="***"))
+
+    monkeypatch.setattr(
+        "gateway.status.acquire_scoped_lock",
+        lambda scope, identity, metadata=None: (True, None),
+    )
+    monkeypatch.setattr(
+        "gateway.status.release_scoped_lock",
+        lambda scope, identity: None,
+    )
+
+    registered_handlers = []
+
+    def _fake_message_handler(message_filter, callback):
+        return {"filter": message_filter, "callback": callback}
+
+    bot = SimpleNamespace(set_my_commands=AsyncMock(), delete_webhook=AsyncMock())
+    app = SimpleNamespace(
+        bot=bot,
+        updater=SimpleNamespace(start_polling=AsyncMock(), stop=AsyncMock(), running=True),
+        add_handler=MagicMock(side_effect=lambda handler: registered_handlers.append(handler)),
+        initialize=AsyncMock(),
+        start=AsyncMock(),
+    )
+    builder = MagicMock()
+    builder.token.return_value = builder
+    builder.build.return_value = app
+
+    monkeypatch.setattr(
+        "gateway.platforms.telegram.Application",
+        SimpleNamespace(builder=MagicMock(return_value=builder)),
+    )
+    monkeypatch.setattr("gateway.platforms.telegram.TelegramMessageHandler", _fake_message_handler)
+    monkeypatch.setattr("gateway.platforms.telegram.CallbackQueryHandler", lambda callback: {"callback": callback})
+
+    ok = await adapter.connect()
+
+    assert ok is True
+    callbacks = [
+        handler["callback"]
+        for handler in registered_handlers
+        if isinstance(handler, dict) and "callback" in handler
+    ]
+    media_idx = callbacks.index(adapter._handle_media_message)
+    text_idx = callbacks.index(adapter._handle_text_message)
+    assert media_idx < text_idx
+
+
+@pytest.mark.asyncio
 async def test_polling_conflict_retries_before_fatal(monkeypatch):
     """A single 409 should trigger a retry, not an immediate fatal error."""
     adapter = TelegramAdapter(PlatformConfig(enabled=True, token="***"))
