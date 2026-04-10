@@ -5383,7 +5383,18 @@ class HermesCLI:
         sub = parts[1].lower().strip() if len(parts) > 1 else "status"
 
         _DEFAULT_CDP = "http://localhost:9222"
-        current = os.environ.get("BROWSER_CDP_URL", "").strip()
+        try:
+            from tools.browser_bridge_state import (
+                clear_browser_bridge_state,
+                get_browser_bridge_cdp_url,
+                merge_browser_bridge_state,
+            )
+        except Exception:
+            clear_browser_bridge_state = lambda: False  # noqa: E731
+            get_browser_bridge_cdp_url = lambda: ""  # noqa: E731
+            merge_browser_bridge_state = lambda payload: payload  # noqa: E731
+
+        current = os.environ.get("BROWSER_CDP_URL", "").strip() or get_browser_bridge_cdp_url()
 
         if sub.startswith("connect"):
             # Optionally accept a custom CDP URL: /browser connect ws://host:port
@@ -5471,7 +5482,20 @@ class HermesCLI:
             else:
                 print(f"   ⚠ Port {_port} is not reachable at {cdp_url}")
 
+            try:
+                from tools.browser_tool import _resolve_cdp_override
+                cdp_url = _resolve_cdp_override(cdp_url)
+            except Exception:
+                pass
+
             os.environ["BROWSER_CDP_URL"] = cdp_url
+            merge_browser_bridge_state({
+                "mode": "real-chrome-cdp",
+                "ready": _already_open,
+                "websocket_url": cdp_url,
+                "cdp_url": cdp_url,
+                "source": "cli/browser connect",
+            })
             print()
             print("🌐 Browser connected to live Chrome via CDP")
             print(f"   Endpoint: {cdp_url}")
@@ -5492,6 +5516,7 @@ class HermesCLI:
         elif sub == "disconnect":
             if current:
                 os.environ.pop("BROWSER_CDP_URL", None)
+                clear_browser_bridge_state()
                 try:
                     from tools.browser_tool import cleanup_all_browsers
                     cleanup_all_browsers()
@@ -5514,6 +5539,7 @@ class HermesCLI:
 
         elif sub == "status":
             print()
+            current = os.environ.get("BROWSER_CDP_URL", "").strip() or get_browser_bridge_cdp_url()
             if current:
                 print("🌐 Browser: connected to live Chrome via CDP")
                 print(f"   Endpoint: {current}")
