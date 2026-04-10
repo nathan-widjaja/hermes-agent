@@ -909,6 +909,22 @@ def _read_cdp_version(port: int) -> Dict[str, Any]:
         return json.loads(response.read().decode("utf-8"))
 
 
+def _real_browser_control_status(app: str = "Google Chrome") -> Dict[str, Any]:
+    """Check whether the live Chrome app is controllable without CDP."""
+    tab_info = host_browser_tab_info(app=app)
+    javascript = host_browser_execute_javascript("location.href", app=app)
+    url = (javascript.get("stdout") or "").strip() or tab_info.get("url", "")
+    title = tab_info.get("title", "")
+    return {
+        "ok": tab_info.get("ok", False) and javascript.get("ok", False),
+        "app": app,
+        "url": url,
+        "title": title,
+        "tab_info": tab_info,
+        "javascript": javascript,
+    }
+
+
 def _is_chrome_running() -> bool:
     completed = subprocess.run(
         ["/bin/zsh", "-lc", "pgrep -f '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome' >/dev/null"],
@@ -1007,7 +1023,10 @@ def host_doctor(include_screenshot_test: bool = False) -> Dict[str, Any]:
             checks["browser_tab_info"].get("ok", False)
             and checks["browser_js"].get("ok", False)
         ),
-        "browser_cdp_ready": checks["browser_status"].get("ready", False),
+        "browser_real_profile_ready": checks["browser_status"].get("ready", False),
+        "browser_cdp_ready": checks["browser_status"].get(
+            "cdp_ready", checks["browser_status"].get("ready", False)
+        ),
     }
     checks["ok"] = all(
         checks["summary"][key]
@@ -1027,33 +1046,48 @@ def host_browser_status(port: int = DEFAULT_PORT) -> Dict[str, Any]:
     """Return structured status for the real Chrome CDP bridge."""
     _ensure_host_dirs()
     state = load_browser_bridge_state()
+    control = _real_browser_control_status()
     try:
         payload = _read_cdp_version(port)
-        ready = True
-        error = ""
+        cdp_ready = True
+        cdp_error = ""
     except Exception as exc:
         payload = {}
-        ready = False
-        error = str(exc)
+        cdp_ready = False
+        cdp_error = str(exc)
+
+    control_ready = control.get("ok", False)
+    ready = cdp_ready or control_ready
+    mode = "real-chrome-cdp" if cdp_ready else ("real-chrome-apple-events" if control_ready else "not-ready")
 
     result = {
         "ok": ready,
         "ready": ready,
+        "cdp_ready": cdp_ready,
+        "control_ready": control_ready,
         "port": int(port),
-        "mode": "real-chrome-cdp" if ready else "not-ready",
+        "mode": mode,
         "browser": payload.get("Browser", ""),
         "protocol_version": payload.get("Protocol-Version", ""),
         "websocket_url": payload.get("webSocketDebuggerUrl", state.get("websocket_url", "")),
         "state_file": str(HOST_BRIDGE_DIR / "state.json"),
         "profile_directory": state.get("profile_directory", DEFAULT_PROFILE_DIRECTORY),
         "chrome_running": _is_chrome_running(),
+        "active_tab_url": control.get("url", ""),
+        "active_tab_title": control.get("title", ""),
+        "control": control,
         "x_account_verified": state.get("x_account_verified"),
         "gemini_verified": state.get("gemini_verified"),
         "last_attached_at": state.get("last_attached_at"),
         "source": state.get("source", "host-bridge"),
     }
-    if error:
-        result["error"] = error
+    if cdp_error:
+        result["error"] = cdp_error
+    if control_ready and not cdp_ready:
+        result["guidance"] = (
+            "Chrome is controllable through Apple Events and GUI automation even though "
+            "legacy CDP attach is unavailable on the real profile."
+        )
     _append_log("host_browser_status", {"port": int(port), "ready": ready})
     return result
 
@@ -1085,7 +1119,17 @@ def host_browser_attach(
     already_running = "already appears live" in stdout.lower()
 
     status = host_browser_status(int(port))
-    if not status.get("ready") and _is_chrome_running() and not force_restart_chrome:
+    if not status.get("cdp_ready", False) and status.get("control_ready", False):
+        result["ok"] = True
+        result["degraded"] = True
+        result["next_step"] = (
+            "Chrome blocked the legacy CDP attach path on the real profile, "
+            "but Hermes can still control the live browser via Apple Events, "
+            "in-tab JavaScript, screenshots, and GUI automation."
+        )
+        result["attach_mode"] = status.get("mode")
+        result["blocked_by_chrome_policy"] = True
+    elif not status.get("ready") and _is_chrome_running() and not force_restart_chrome:
         result["next_step"] = (
             "Chrome is already running without CDP on the real profile. "
             "Retry with force_restart_chrome=true to restart Chrome into attachable mode."
@@ -1096,7 +1140,9 @@ def host_browser_attach(
         {
             **persisted,
             "ready": status.get("ready", False),
-            "mode": "real-chrome-cdp" if status.get("ready") else "attach-failed",
+            "cdp_ready": status.get("cdp_ready", False),
+            "control_ready": status.get("control_ready", False),
+            "mode": status.get("mode", "attach-failed"),
             "websocket_url": websocket_url or status.get("websocket_url", ""),
             "cdp_url": websocket_url or status.get("websocket_url", ""),
             "port": int(port),

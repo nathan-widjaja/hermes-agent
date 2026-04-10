@@ -69,6 +69,18 @@ def test_host_browser_status_reads_persisted_state_when_port_unreachable(monkeyp
     monkeypatch.setattr(host_bridge, "_read_cdp_version", lambda port: (_ for _ in ()).throw(OSError("boom")))
     monkeypatch.setattr(
         host_bridge,
+        "_real_browser_control_status",
+        lambda app="Google Chrome": {
+            "ok": False,
+            "app": app,
+            "url": "",
+            "title": "",
+            "tab_info": {"ok": False},
+            "javascript": {"ok": False},
+        },
+    )
+    monkeypatch.setattr(
+        host_bridge,
         "load_browser_bridge_state",
         lambda: {
             "profile_directory": "Profile 2",
@@ -83,9 +95,51 @@ def test_host_browser_status_reads_persisted_state_when_port_unreachable(monkeyp
     result = host_bridge.host_browser_status(port=9222)
 
     assert result["ready"] is False
+    assert result["cdp_ready"] is False
+    assert result["control_ready"] is False
     assert result["websocket_url"] == "ws://127.0.0.1:9222/devtools/browser/demo"
     assert result["profile_directory"] == "Profile 2"
     assert result["x_account_verified"] is True
+
+
+def test_host_browser_status_falls_back_to_real_chrome_control_when_cdp_unreachable(monkeypatch, tmp_path):
+    import tools.host_bridge as host_bridge
+
+    monkeypatch.setattr(host_bridge, "HOST_BRIDGE_DIR", tmp_path / "state")
+    monkeypatch.setattr(host_bridge, "HOST_BRIDGE_LOG", tmp_path / "logs" / "host-bridge.log")
+    monkeypatch.setattr(host_bridge, "_read_cdp_version", lambda port: (_ for _ in ()).throw(OSError("boom")))
+    monkeypatch.setattr(
+        host_bridge,
+        "_real_browser_control_status",
+        lambda app="Google Chrome": {
+            "ok": True,
+            "app": app,
+            "url": "https://x.com/home",
+            "title": "Home / X",
+            "tab_info": {"ok": True, "url": "https://x.com/home", "title": "Home / X"},
+            "javascript": {"ok": True, "stdout": "https://x.com/home\n"},
+        },
+    )
+    monkeypatch.setattr(
+        host_bridge,
+        "load_browser_bridge_state",
+        lambda: {
+            "profile_directory": "Default",
+            "x_account_verified": True,
+            "gemini_verified": False,
+            "last_attached_at": "2026-04-10T00:00:00+00:00",
+            "source": "test",
+        },
+    )
+    monkeypatch.setattr(host_bridge, "_is_chrome_running", lambda: True)
+
+    result = host_bridge.host_browser_status(port=9222)
+
+    assert result["ready"] is True
+    assert result["cdp_ready"] is False
+    assert result["control_ready"] is True
+    assert result["mode"] == "real-chrome-apple-events"
+    assert result["active_tab_url"] == "https://x.com/home"
 
 
 def test_host_browser_attach_persists_browser_state(monkeypatch, tmp_path):
@@ -139,6 +193,55 @@ def test_host_browser_attach_persists_browser_state(monkeypatch, tmp_path):
     assert saved["gemini_verified"] is False
 
 
+def test_host_browser_attach_succeeds_with_real_chrome_control_fallback(monkeypatch, tmp_path):
+    import tools.host_bridge as host_bridge
+
+    monkeypatch.setattr(host_bridge, "X_ATTACH_SCRIPT", Path("/tmp/fake-attach.sh"))
+    monkeypatch.setattr(host_bridge, "HOST_BRIDGE_DIR", tmp_path / "state")
+    monkeypatch.setattr(host_bridge, "HOST_BRIDGE_LOG", tmp_path / "logs" / "host-bridge.log")
+    monkeypatch.setattr(host_bridge, "_is_chrome_running", lambda: True)
+    monkeypatch.setattr(
+        host_bridge,
+        "_run_host_command",
+        lambda *args, **kwargs: {
+            "ok": False,
+            "exit_code": 2,
+            "stdout": "",
+            "stderr": "no cdp",
+        },
+    )
+    monkeypatch.setattr(
+        host_bridge,
+        "host_browser_status",
+        lambda port=9222: {
+            "ok": True,
+            "ready": True,
+            "cdp_ready": False,
+            "control_ready": True,
+            "mode": "real-chrome-apple-events",
+            "port": port,
+            "websocket_url": "",
+        },
+    )
+    monkeypatch.setattr(host_bridge, "load_browser_bridge_state", lambda: {})
+
+    saved = {}
+
+    def _save(payload):
+        saved.update(payload)
+        return tmp_path / "state" / "state.json"
+
+    monkeypatch.setattr(host_bridge, "save_browser_bridge_state", _save)
+
+    result = host_bridge.host_browser_attach(port=9222, profile_directory="Default")
+
+    assert result["ok"] is True
+    assert result["degraded"] is True
+    assert result["blocked_by_chrome_policy"] is True
+    assert saved["mode"] == "real-chrome-apple-events"
+    assert saved["control_ready"] is True
+
+
 def test_host_browser_attach_surfaces_restart_hint(monkeypatch, tmp_path):
     import tools.host_bridge as host_bridge
 
@@ -162,6 +265,8 @@ def test_host_browser_attach_surfaces_restart_hint(monkeypatch, tmp_path):
         lambda port=9222: {
             "ok": False,
             "ready": False,
+            "cdp_ready": False,
+            "control_ready": False,
             "port": port,
             "websocket_url": "",
         },
