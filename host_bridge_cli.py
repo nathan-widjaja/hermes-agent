@@ -18,11 +18,13 @@ from tools.host_bridge import (
     host_exec,
     host_focus_app,
     host_browser_execute_javascript,
+    host_browser_x_reply,
     host_browser_enable_apple_event_javascript,
     host_browser_tab_info,
     host_gui_doctor,
     host_hotkey,
     host_keystroke,
+    host_paste,
     host_list_dir,
     host_move_mouse,
     host_open_url,
@@ -30,6 +32,7 @@ from tools.host_bridge import (
     host_press_key,
     host_read_path,
     host_screenshot,
+    host_browser_window_screenshot,
     host_service_control,
     host_service_status,
     host_tail_path,
@@ -102,6 +105,11 @@ def main() -> int:
     screenshot_p.add_argument("--path")
     screenshot_p.add_argument("--open-preview", action="store_true")
 
+    browser_window_screenshot_p = subparsers.add_parser("browser-window-screenshot")
+    browser_window_screenshot_p.add_argument("--path")
+    browser_window_screenshot_p.add_argument("--app", default="Google Chrome")
+    browser_window_screenshot_p.add_argument("--open-preview", action="store_true")
+
     keystroke_p = subparsers.add_parser("keystroke")
     keystroke_p.add_argument("--text", required=True)
     keystroke_p.add_argument("--app")
@@ -136,6 +144,12 @@ def main() -> int:
     type_p.add_argument("--app")
     type_p.add_argument("--wait-ms", type=int, default=80)
 
+    paste_p = subparsers.add_parser("paste")
+    paste_p.add_argument("--text", required=True)
+    paste_p.add_argument("--app")
+    paste_p.add_argument("--wait-ms", type=int, default=80)
+    paste_p.add_argument("--no-preserve-clipboard", action="store_true")
+
     press_p = subparsers.add_parser("press-key")
     press_p.add_argument("--key", required=True)
     press_p.add_argument("--wait-ms", type=int, default=80)
@@ -158,6 +172,13 @@ def main() -> int:
     js_p = subparsers.add_parser("browser-js")
     js_p.add_argument("--script", required=True)
     js_p.add_argument("--app", default="Google Chrome")
+
+    x_reply_p = subparsers.add_parser("browser-x-reply")
+    x_reply_p.add_argument("--tweet-url", required=True)
+    x_reply_p.add_argument("--text", required=True)
+    x_reply_p.add_argument("--app", default="Google Chrome")
+    x_reply_p.add_argument("--submit", action="store_true")
+    x_reply_p.add_argument("--wait-ms", type=int, default=120)
 
     enable_js_p = subparsers.add_parser("browser-enable-apple-event-js")
     enable_js_p.add_argument("--profile-directory", default="Default")
@@ -219,6 +240,8 @@ def main() -> int:
         )
     elif args.command == "screenshot":
         payload = host_screenshot(args.path, open_preview=args.open_preview)
+    elif args.command == "browser-window-screenshot":
+        payload = host_browser_window_screenshot(args.path, app=args.app, open_preview=args.open_preview)
     elif args.command == "keystroke":
         payload = host_keystroke(args.text, app=args.app)
     elif args.command == "cursor-position":
@@ -239,6 +262,13 @@ def main() -> int:
         )
     elif args.command == "type":
         payload = host_type(args.text, app=args.app, wait_ms=args.wait_ms)
+    elif args.command == "paste":
+        payload = host_paste(
+            args.text,
+            app=args.app,
+            wait_ms=args.wait_ms,
+            preserve_clipboard=not args.no_preserve_clipboard,
+        )
     elif args.command == "press-key":
         payload = host_press_key(args.key, wait_ms=args.wait_ms)
     elif args.command == "hotkey":
@@ -255,6 +285,14 @@ def main() -> int:
         payload = host_browser_tab_info(app=args.app)
     elif args.command == "browser-js":
         payload = host_browser_execute_javascript(args.script, app=args.app)
+    elif args.command == "browser-x-reply":
+        payload = host_browser_x_reply(
+            args.tweet_url,
+            args.text,
+            app=args.app,
+            submit=args.submit,
+            wait_ms=args.wait_ms,
+        )
     elif args.command == "browser-enable-apple-event-js":
         payload = host_browser_enable_apple_event_javascript(
             profile_directory=args.profile_directory,

@@ -152,6 +152,7 @@ def _discover_tools():
         "tools.memory_tool",
         "tools.session_search_tool",
         "tools.clarify_tool",
+        "tools.ask_decision_tool",
         "tools.code_execution_tool",
         "tools.delegate_tool",
         "tools.process_registry",

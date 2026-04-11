@@ -150,6 +150,7 @@ from pathlib import Path as _Path
 sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
 
 from gateway.config import Platform, PlatformConfig
+from gateway.artifact_verifier import verify_local_image
 from gateway.session import SessionSource, build_session_key
 from hermes_constants import get_hermes_dir
 
@@ -1534,6 +1535,24 @@ class BasePlatformAdapter(ABC):
                                 metadata=_thread_metadata,
                             )
                         elif ext in _IMAGE_EXTS:
+                            verification = verify_local_image(media_path, event.text, response)
+                            if not verification.allowed:
+                                logger.warning(
+                                    "[%s] Blocking outbound image %s (%s)",
+                                    self.name,
+                                    media_path,
+                                    verification.reason,
+                                )
+                                await self._send_with_retry(
+                                    chat_id=event.source.chat_id,
+                                    content=(
+                                        "⚠️ I blocked an image because it did not verify as the requested screenshot/proof. "
+                                        "I need to recapture the correct artifact before sending it."
+                                    ),
+                                    reply_to=event.message_id,
+                                    metadata=_thread_metadata,
+                                )
+                                continue
                             media_result = await self.send_image_file(
                                 chat_id=event.source.chat_id,
                                 image_path=media_path,
@@ -1558,6 +1577,24 @@ class BasePlatformAdapter(ABC):
                     try:
                         ext = Path(file_path).suffix.lower()
                         if ext in _IMAGE_EXTS:
+                            verification = verify_local_image(file_path, event.text, response)
+                            if not verification.allowed:
+                                logger.warning(
+                                    "[%s] Blocking outbound local image %s (%s)",
+                                    self.name,
+                                    file_path,
+                                    verification.reason,
+                                )
+                                await self._send_with_retry(
+                                    chat_id=event.source.chat_id,
+                                    content=(
+                                        "⚠️ I blocked an image because it did not verify as the requested screenshot/proof. "
+                                        "I need to recapture the correct artifact before sending it."
+                                    ),
+                                    reply_to=event.message_id,
+                                    metadata=_thread_metadata,
+                                )
+                                continue
                             await self.send_image_file(
                                 chat_id=event.source.chat_id,
                                 image_path=file_path,

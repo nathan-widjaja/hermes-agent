@@ -329,6 +329,24 @@ DEFAULT_CONFIG = {
         "max_snapshots": 50,  # Max checkpoints to keep per directory
     },
 
+    # Durable Runs / Execution Spine
+    "execution_spine": {
+        "enabled": False,
+        "admission_mode": "auto",      # off | auto | force
+        "lease_seconds": 90,
+        "checkpoint_cadence": "step",  # step | tool | off
+        "queue_updates": True,
+        "max_run_seconds": 21600,
+        "max_wait_for_user_seconds": 86400,
+        "max_child_seconds": 1800,
+        "force_off": False,
+        "force_on": False,
+        "effect_idempotency": {
+            "send_message": True,
+            "cronjob": True,
+        },
+    },
+
     # Maximum characters returned by a single read_file call.  Reads that
     # exceed this are rejected with guidance to use offset+limit.
     # 100K chars ≈ 25–35K tokens across typical tokenisers.

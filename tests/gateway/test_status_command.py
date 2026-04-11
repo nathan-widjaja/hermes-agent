@@ -9,6 +9,7 @@ import pytest
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent
 from gateway.session import SessionEntry, SessionSource, build_session_key
+from durable_runs import AdmissionDecision, DurableRunDB
 
 
 def _make_source() -> SessionSource:
@@ -109,6 +110,37 @@ async def test_status_command_includes_session_title_when_present():
 
     assert "**Session ID:** `sess-1`" in result
     assert "**Title:** My titled session" in result
+
+
+@pytest.mark.asyncio
+async def test_status_command_prioritizes_active_durable_run(tmp_path):
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id="sess-1",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        total_tokens=321,
+    )
+    runner = _make_runner(session_entry)
+    runner._durable_run_db = DurableRunDB(tmp_path / "execution_state.db")
+    runner._durable_run_db.create_run(
+        session_id="sess-1",
+        workflow_name="AA/Nathan Founder Setup",
+        source_platform="telegram",
+        source_chat_id="c1",
+        user_id="u1",
+        request_text="founder setup",
+        admission=AdmissionDecision(True, "force", 1.0, ["test"], "forced"),
+        claimant="gateway:test",
+    )
+
+    result = await runner._handle_message(_make_event("/status"))
+
+    assert "🧵 **Durable Run**" in result
+    assert "**Workflow:** AA/Nathan Founder Setup" in result
+    assert "**Session ID:** `sess-1`" in result
 
 
 @pytest.mark.asyncio

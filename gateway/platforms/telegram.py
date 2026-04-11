@@ -1559,12 +1559,30 @@ class TelegramAdapter(BasePlatformAdapter):
                 )
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
+            error_text = str(e)
             logger.error(
-                "[%s] Failed to send Telegram local image, falling back to base adapter: %s",
+                "[%s] Failed to send Telegram local image, falling back to document/base adapter: %s",
                 self.name,
-                e,
+                error_text,
                 exc_info=True,
             )
+
+            # Telegram photos are capped at 10 MB. If a local image is too large to
+            # send as a photo, degrade to a document attachment instead of leaking the
+            # raw file path back to the user via the base adapter text fallback.
+            oversized_photo = (
+                "too big for a photo" in error_text.lower()
+                or "photo must be non-empty" in error_text.lower()
+            )
+            if oversized_photo:
+                return await self.send_document(
+                    chat_id=chat_id,
+                    file_path=image_path,
+                    caption=caption,
+                    reply_to=reply_to,
+                    metadata=metadata,
+                )
+
             return await super().send_image_file(chat_id, image_path, caption, reply_to)
 
     async def send_document(

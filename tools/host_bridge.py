@@ -10,6 +10,7 @@ import shlex
 import shutil
 import subprocess
 import time
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -209,6 +210,27 @@ def _run_host_command(
     return result
 
 
+def _clipboard_read() -> str:
+    completed = subprocess.run(
+        ["/usr/bin/pbpaste"],
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    return completed.stdout if completed.returncode == 0 else ""
+
+
+def _clipboard_write(text: str) -> None:
+    subprocess.run(
+        ["/usr/bin/pbcopy"],
+        input=text,
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=True,
+    )
+
+
 def _run_host_args(
     args: List[str],
     *,
@@ -405,6 +427,42 @@ def host_keystroke(text: str, app: Optional[str] = None) -> Dict[str, Any]:
     return result
 
 
+
+def host_paste(
+    text: str,
+    app: Optional[str] = None,
+    *,
+    wait_ms: int = DEFAULT_CLICK_WAIT_MS,
+    preserve_clipboard: bool = True,
+) -> Dict[str, Any]:
+    """Paste exact text into the foreground app via the system clipboard."""
+    if app:
+        focus_result = host_focus_app(app)
+        if not focus_result.get("ok"):
+            return focus_result
+
+    previous_clipboard: Optional[str] = None
+    try:
+        if preserve_clipboard:
+            previous_clipboard = _clipboard_read()
+        _clipboard_write(text)
+        result = host_hotkey(["cmd"], "v", wait_ms=wait_ms)
+    except subprocess.SubprocessError as exc:
+        return _result_from_exception(str(exc), app=app, text=text)
+    finally:
+        if preserve_clipboard and previous_clipboard is not None:
+            time.sleep(0.05)
+            try:
+                _clipboard_write(previous_clipboard)
+            except subprocess.SubprocessError:
+                pass
+
+    result["text"] = text
+    result["app"] = app
+    result["preserve_clipboard"] = preserve_clipboard
+    return result
+
+
 def _resolve_cliclick_path() -> Optional[Path]:
     for candidate in CLICLICK_CANDIDATES:
         if candidate.exists():
@@ -549,10 +607,13 @@ def host_type(text: str, app: Optional[str] = None, *, wait_ms: int = DEFAULT_CL
         focus_result = host_focus_app(app)
         if not focus_result.get("ok"):
             return focus_result
-    lines = text.splitlines() or [""]
+    if text == "":
+        return {"ok": True, "text": text, "app": app, "noop": True}
+    lines = text.split("\n")
     commands: List[str] = []
     for idx, line in enumerate(lines):
-        commands.append(f"t:{line}")
+        if line:
+            commands.append(f"t:{line}")
         if idx < len(lines) - 1:
             commands.append("kp:return")
     try:
@@ -594,6 +655,145 @@ def host_hotkey(modifiers: List[str], key: str, *, wait_ms: int = DEFAULT_CLICK_
     return result
 
 
+def _capture_browser_window_with_sck(app: str, target: Path) -> Dict[str, Any]:
+    """Capture the front browser window with ScreenCaptureKit.
+
+    This is the correct macOS 15+ path for window capture. It either returns a
+    real browser-window screenshot or a clear permission/availability failure.
+    """
+    try:
+        front_title = host_browser_tab_info(app=app).get("title") or ""
+    except TypeError:
+        # Keep compatibility with older test doubles / monkeypatches that expose
+        # a zero-arg host_browser_tab_info helper.
+        front_title = host_browser_tab_info().get("title") or ""
+    swift = f'''
+import Foundation
+import ScreenCaptureKit
+import AppKit
+
+@main
+struct Main {{
+    static func main() async {{
+        _ = NSApplication.shared
+        do {{
+            let targetPath = {json.dumps(str(target))}
+            let appName = {json.dumps(app)}
+            let frontTitle = {json.dumps(front_title)}
+            let content = try await SCShareableContent.current
+            let windows = content.windows.filter {{ w in
+                let owner = w.owningApplication?.applicationName ?? ""
+                return owner == appName && w.isOnScreen && w.frame.width > 100 && w.frame.height > 100
+            }}
+            let sortedWindows = windows.sorted {{ lhs, rhs in
+                let lhsTitle = lhs.title ?? ""
+                let rhsTitle = rhs.title ?? ""
+                let lhsScore = (lhsTitle == frontTitle ? 1000000.0 : 0.0) + lhs.frame.width * lhs.frame.height
+                let rhsScore = (rhsTitle == frontTitle ? 1000000.0 : 0.0) + rhs.frame.width * rhs.frame.height
+                return lhsScore > rhsScore
+            }}
+            guard let window = sortedWindows.first else {{
+                print("NO_WINDOW")
+                return
+            }}
+            let filter = SCContentFilter(desktopIndependentWindow: window)
+            let config = SCStreamConfiguration()
+            config.width = max(Int(window.frame.width), 1)
+            config.height = max(Int(window.frame.height), 1)
+            let image = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
+            let rep = NSBitmapImageRep(cgImage: image)
+            guard let data = rep.representation(using: .png, properties: [:]) else {{
+                print("ENCODE_FAIL")
+                return
+            }}
+            try data.write(to: URL(fileURLWithPath: targetPath))
+            print("OK")
+        }} catch {{
+            print("ERR: \\(error)")
+        }}
+    }}
+}}
+'''
+    try:
+        with tempfile.TemporaryDirectory(prefix="hermes-sck-") as tmpdir:
+            src = Path(tmpdir) / "capture.swift"
+            bin_path = Path(tmpdir) / "capture"
+            src.write_text(swift, encoding="utf-8")
+            compile_result = _run_host_command(
+                f"/usr/bin/swiftc -parse-as-library {shlex.quote(str(src))} -o {shlex.quote(str(bin_path))}",
+                timeout_sec=90,
+            )
+            if not compile_result.get("ok"):
+                return compile_result
+            run_result = _run_host_command(str(bin_path), timeout_sec=90)
+            stdout = (run_result.get("stdout") or "").strip()
+            if not run_result.get("ok"):
+                return run_result
+            if stdout == "OK" and target.exists():
+                return {
+                    "ok": True,
+                    "stdout": stdout,
+                    "stderr": run_result.get("stderr", ""),
+                    "exit_code": run_result.get("exit_code", 0),
+                    "cwd": run_result.get("cwd", str(HOST_ROOT)),
+                    "timeout_sec": run_result.get("timeout_sec", 90),
+                }
+            if "declined TCCs" in stdout:
+                return {
+                    "ok": False,
+                    "blocked": True,
+                    "blocked_reason": "macOS ScreenCaptureKit permission denied for application/window/display capture",
+                    "stdout": stdout,
+                    "stderr": run_result.get("stderr", ""),
+                    "exit_code": run_result.get("exit_code", 0),
+                    "cwd": run_result.get("cwd", str(HOST_ROOT)),
+                    "timeout_sec": run_result.get("timeout_sec", 90),
+                }
+            return {
+                "ok": False,
+                "stdout": stdout,
+                "stderr": run_result.get("stderr", ""),
+                "exit_code": run_result.get("exit_code", 0),
+                "cwd": run_result.get("cwd", str(HOST_ROOT)),
+                "timeout_sec": run_result.get("timeout_sec", 90),
+            }
+    except Exception as exc:
+        return _result_from_exception(str(exc), app=app)
+
+
+def host_browser_window_screenshot(path: Optional[str] = None, app: str = "Google Chrome", open_preview: bool = False) -> Dict[str, Any]:
+    """Capture only the front browser window from the real Mac host.
+
+    Uses ScreenCaptureKit for true window capture. If macOS privacy permissions
+    are missing, returns a clear failure instead of falling back to a misleading
+    desktop crop.
+    """
+    if app not in {"Google Chrome", "Safari"}:
+        return {
+            "ok": False,
+            "blocked": True,
+            "blocked_reason": "Browser window screenshot is only enabled for Google Chrome or Safari.",
+            "app": app,
+        }
+    if path:
+        target = _expand_host_path(path)
+    else:
+        target = HOST_BRIDGE_DIR / "screenshots" / f"browser-window-{datetime.now().strftime('%Y%m%d-%H%M%S')}.png"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    result = _capture_browser_window_with_sck(app, target)
+    result.update({
+        "path": str(target),
+        "app": app,
+    })
+    if result.get("ok"):
+        result["bytes"] = target.stat().st_size if target.exists() else 0
+        if open_preview:
+            host_open_app("Finder")
+            _run_host_command(f"/usr/bin/open {shlex.quote(str(target))}", timeout_sec=10)
+    _append_log("host_browser_window_screenshot", {"ok": result.get("ok", False), "app": app, "path": str(target), "blocked": result.get("blocked", False)})
+    return result
+
+
 def host_ui_snapshot(path: Optional[str] = None) -> Dict[str, Any]:
     """Capture a structured UI snapshot of the real Mac host."""
     frontmost = host_applescript("frontmost_app")
@@ -617,6 +817,7 @@ def host_ui_snapshot(path: Optional[str] = None) -> Dict[str, Any]:
     }
     if payload["frontmost_app"] == "Google Chrome":
         payload["browser_tab"] = host_browser_tab_info()
+        payload["browser_window_screenshot"] = host_browser_window_screenshot(path=path, app="Google Chrome")
     _append_log(
         "host_ui_snapshot",
         {
@@ -766,6 +967,167 @@ def host_browser_execute_javascript(script: str, app: str = "Google Chrome") -> 
         timeout_sec=20,
     )
     result["app"] = app
+    return result
+
+
+def _host_browser_eval_json(script: str, app: str = "Google Chrome") -> Dict[str, Any]:
+    result = host_browser_execute_javascript(script, app=app)
+    stdout = (result.get("stdout") or "").strip()
+    if not result.get("ok"):
+        return {"ok": False, "error": result.get("stderr") or result.get("error") or "browser js failed", "raw": result}
+    try:
+        payload = json.loads(stdout) if stdout else None
+    except json.JSONDecodeError:
+        return {"ok": False, "error": "browser js did not return JSON", "stdout": stdout, "raw": result}
+    return {"ok": True, "value": payload, "raw": result}
+
+
+def _x_reply_state_script(open_reply: bool = True) -> str:
+    open_reply_flag = "true" if open_reply else "false"
+    return f"""(() => {{
+  const visible = (el) => {{
+    if (!el) return false;
+    const s = getComputedStyle(el);
+    const r = el.getBoundingClientRect();
+    return s.display !== 'none' && s.visibility !== 'hidden' && Number(s.opacity || '1') > 0 && r.width > 0 && r.height > 0;
+  }};
+  const center = (r) => ({{ x: r.left + r.width / 2, y: r.top + r.height / 2 }});
+  const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+  const textareas = [...document.querySelectorAll('[data-testid=\"tweetTextarea_0\"]')].filter(visible).map((el, i) => {{
+    const r = el.getBoundingClientRect();
+    return {{ index: i, text: el.innerText, rect: {{ left: r.left, top: r.top, width: r.width, height: r.height }}, center: center(r) }};
+  }});
+  const submitButtons = [...document.querySelectorAll('[data-testid=\"tweetButtonInline\"], [data-testid=\"tweetButton\"]')]
+    .filter(visible)
+    .filter((el) => (el.innerText || '').trim() === 'Reply')
+    .map((el, i) => {{
+      const r = el.getBoundingClientRect();
+      return {{ index: i, disabled: el.getAttribute('aria-disabled') || el.disabled || null, rect: {{ left: r.left, top: r.top, width: r.width, height: r.height }}, center: center(r) }};
+    }});
+  let best = null;
+  for (const box of textareas) {{
+    for (const btn of submitButtons) {{
+      const score = dist(box.center, btn.center);
+      if (!best || score < best.score) best = {{ score, box, btn }};
+    }}
+  }}
+  const replyTriggers = [...document.querySelectorAll('[data-testid=\"reply\"]')].filter(visible);
+  if (!best && {open_reply_flag} && replyTriggers.length) {{
+    replyTriggers[0].click();
+    return JSON.stringify({{ ok: true, action: 'clicked_reply', url: location.href }});
+  }}
+  return JSON.stringify({{
+    ok: !!best,
+    action: best ? 'ready' : 'not_found',
+    url: location.href,
+    textareas,
+    submitButtons,
+    active: best ? {{ composer: best.box, button: best.btn, current_text: best.box.text }} : null,
+  }});
+}})()"""
+
+
+def _normalize_browser_text(value: str) -> str:
+    return (value or "").replace("\r\n", "\n").strip()
+
+
+def host_browser_x_reply(
+    tweet_url: str,
+    text: str,
+    *,
+    app: str = "Google Chrome",
+    submit: bool = False,
+    wait_ms: int = 120,
+) -> Dict[str, Any]:
+    if tweet_url:
+        open_result = host_open_url(tweet_url, app=app)
+        if not open_result.get("ok"):
+            return open_result
+        time.sleep(0.8)
+    else:
+        open_result = {"ok": True, "url": ""}
+
+    payload = {}
+    state = {"ok": False}
+    for attempt in range(6):
+        state = _host_browser_eval_json(_x_reply_state_script(open_reply=attempt == 0), app=app)
+        if not state.get("ok"):
+            return state
+        payload = state.get("value") or {}
+        if payload.get("action") == "clicked_reply":
+            time.sleep(0.8)
+            continue
+        if payload.get("active"):
+            break
+        time.sleep(0.6)
+
+    active = payload.get("active")
+    if not active:
+        return _result_from_exception("Could not locate an active X reply composer", tweet_url=tweet_url, payload=payload)
+
+    composer = active["composer"]["center"]
+    button = active["button"]["center"]
+
+    click_result = host_click(int(composer["x"]), int(composer["y"]), wait_ms=wait_ms)
+    if not click_result.get("ok"):
+        return click_result
+    clear_hotkey = host_hotkey(["cmd"], "a", wait_ms=wait_ms)
+    if not clear_hotkey.get("ok"):
+        return clear_hotkey
+    delete_result = host_press_key("delete", wait_ms=wait_ms)
+    if not delete_result.get("ok"):
+        return delete_result
+    paste_result = host_paste(text, app=app, wait_ms=wait_ms, preserve_clipboard=True)
+    if not paste_result.get("ok"):
+        return paste_result
+
+    verify = _host_browser_eval_json(_x_reply_state_script(open_reply=False), app=app)
+    if not verify.get("ok"):
+        return verify
+    verify_payload = verify.get("value") or {}
+    verify_active = verify_payload.get("active") or {}
+    current_text = _normalize_browser_text(verify_active.get("current_text", ""))
+    expected_text = _normalize_browser_text(text)
+    if current_text != expected_text:
+        return _result_from_exception(
+            "X reply composer text mismatch after paste",
+            tweet_url=tweet_url,
+            expected_text=expected_text,
+            current_text=current_text,
+            verify_payload=verify_payload,
+        )
+
+    if verify_active.get("button", {}).get("disabled") == "true":
+        host_press_key("arrow-left", wait_ms=wait_ms)
+        host_press_key("arrow-right", wait_ms=wait_ms)
+        verify = _host_browser_eval_json(_x_reply_state_script(open_reply=False), app=app)
+        if not verify.get("ok"):
+            return verify
+        verify_payload = verify.get("value") or {}
+        verify_active = verify_payload.get("active") or {}
+
+    result = {
+        "ok": True,
+        "tweet_url": tweet_url,
+        "text": text,
+        "open_result": open_result,
+        "state": payload,
+        "verify": verify_payload,
+        "submitted": False,
+    }
+
+    if submit:
+        if verify_active.get("button", {}).get("disabled") == "true":
+            return _result_from_exception(
+                "X reply button stayed disabled after exact paste and trust nudge",
+                tweet_url=tweet_url,
+                verify_payload=verify_payload,
+            )
+        submit_result = host_click(int(button["x"]), int(button["y"]), wait_ms=wait_ms)
+        result["submit_result"] = submit_result
+        result["submitted"] = submit_result.get("ok", False)
+        result["ok"] = submit_result.get("ok", False)
+
     return result
 
 

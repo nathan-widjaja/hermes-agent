@@ -982,6 +982,29 @@ def run_doctor(args):
         pass
 
     # =========================================================================
+    # Durable Runs
+    # =========================================================================
+    print()
+    print(color("◆ Durable Runs", Colors.CYAN, Colors.BOLD))
+    try:
+        from durable_runs import DurableRunDB
+
+        durable_db = DurableRunDB()
+        try:
+            payload = durable_db.doctor()
+        finally:
+            durable_db.close()
+        check_ok("Execution store reachable", f"({payload['db_path']})")
+        check_info(f"schema v{payload['schema_version']} | {payload['run_count']} total run(s) | {payload['active_run_count']} active")
+        if payload["stuck_waiting_count"] > 0:
+            check_warn("Runs waiting on user/external input for >1h", f"({payload['stuck_waiting_count']})")
+        if payload["stale_lease_count"] > 0:
+            check_warn("Stale Durable Run leases detected", f"({payload['stale_lease_count']})")
+            issues.append("Inspect Durable Runs with 'hermes runs doctor' and clear stale leases if needed")
+    except Exception as exc:
+        check_warn("Durable Runs store unavailable", f"({exc})")
+
+    # =========================================================================
     # Summary
     # =========================================================================
     print()

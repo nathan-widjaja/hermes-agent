@@ -213,7 +213,7 @@ class IterationBudget:
 
 # Tools that must never run concurrently (interactive / user-facing).
 # When any of these appear in a batch, we fall back to sequential execution.
-_NEVER_PARALLEL_TOOLS = frozenset({"clarify"})
+_NEVER_PARALLEL_TOOLS = frozenset({"clarify", "ask_decision"})
 
 # Read-only tools with no shared mutable session state.
 _PARALLEL_SAFE_TOOLS = frozenset({
@@ -629,6 +629,7 @@ class AIAgent:
         self.reasoning_callback = reasoning_callback
         self._reasoning_deltas_fired = False  # Set by _fire_reasoning_delta, reset per API call
         self.clarify_callback = clarify_callback
+        self.durable_run_context = None
         self.step_callback = step_callback
         self.stream_delta_callback = stream_delta_callback
         self.status_callback = status_callback
@@ -6220,6 +6221,87 @@ class AIAgent:
         finally:
             self._executing_tools = False
 
+    def _durable_decision_key(self, function_name: str, function_args: dict) -> str:
+        question = str(function_args.get("question", "") or "").strip()
+        choices = function_args.get("choices") or []
+        if function_name == "ask_decision":
+            explicit = str(function_args.get("decision_key", "") or "").strip()
+            if explicit:
+                return explicit
+        seed = json.dumps({"question": question, "choices": choices}, sort_keys=True, ensure_ascii=False)
+        return f"{function_name}:{hashlib.sha1(seed.encode('utf-8')).hexdigest()[:16]}"
+
+    def _invoke_durable_decision(self, function_name: str, function_args: dict) -> Optional[str]:
+        ctx = getattr(self, "durable_run_context", None)
+        if ctx is None:
+            return None
+        question = str(function_args.get("question", "") or "").strip()
+        if not question:
+            return json.dumps({"error": "question is required"}, ensure_ascii=False)
+        decision_key = self._durable_decision_key(function_name, function_args)
+        answer_type = str(function_args.get("answer_type", "open_text") or "open_text").strip() or "open_text"
+        result = ctx.ask_decision(
+            decision_key=decision_key,
+            question=question,
+            choices=function_args.get("choices"),
+            answer_type=answer_type,
+            callback=self.clarify_callback,
+            metadata={
+                "tool_name": function_name,
+                "session_id": self.session_id,
+                "platform": self.platform,
+            },
+        )
+        return json.dumps(result, ensure_ascii=False)
+
+    def _invoke_effectful_tool(self, function_name: str, function_args: dict, effective_task_id: str,
+                               tool_call_id: Optional[str] = None) -> str:
+        ctx = getattr(self, "durable_run_context", None)
+        effect = None
+        if ctx is not None and function_name in {"send_message", "cronjob"}:
+            try:
+                effect = ctx.plan_effect(function_name, function_args)
+                if effect and effect.get("status") in {"planned", "confirmed", "applied"} and effect.get("run_id"):
+                    # Duplicate logical effect: return existing metadata instead of re-applying.
+                    if effect.get("status") in {"confirmed", "applied"} and effect.get("request_hash"):
+                        return json.dumps(
+                            {
+                                "success": True,
+                                "status": "deduplicated",
+                                "effect_type": function_name,
+                                "target": effect.get("target"),
+                                "logical_effect_key": effect.get("logical_effect_key"),
+                            },
+                            ensure_ascii=False,
+                        )
+            except Exception as exc:
+                logger.debug("Durable effect plan failed for %s: %s", function_name, exc)
+                effect = None
+        try:
+            result = handle_function_call(
+                function_name, function_args, effective_task_id,
+                tool_call_id=tool_call_id,
+                session_id=self.session_id or "",
+                enabled_tools=list(self.valid_tool_names) if self.valid_tool_names else None,
+            )
+            if ctx is not None and effect is not None:
+                try:
+                    payload = json.loads(result) if isinstance(result, str) else result
+                except Exception:
+                    payload = {"raw": str(result)}
+                error_text = None
+                if isinstance(payload, dict) and payload.get("error"):
+                    error_text = str(payload.get("error"))
+                ctx.finish_effect(effect, result_payload=payload if isinstance(payload, dict) else {"raw": str(payload)}, error=error_text)
+            return result
+        except Exception as exc:
+            if ctx is not None and effect is not None:
+                try:
+                    ctx.finish_effect(effect, result_payload={"error": str(exc)}, error=str(exc))
+                except Exception:
+                    pass
+            raise
+
     def _invoke_tool(self, function_name: str, function_args: dict, effective_task_id: str,
                      tool_call_id: Optional[str] = None) -> str:
         """Invoke a single tool and return the result string. No display logic.
@@ -6228,6 +6310,11 @@ class AIAgent:
         tools. Used by the concurrent execution path; the sequential path retains
         its own inline invocation for backward-compatible display handling.
         """
+        if self.durable_run_context is not None:
+            try:
+                self.durable_run_context.heartbeat()
+            except Exception:
+                pass
         if function_name == "todo":
             from tools.todo_tool import todo_tool as _todo_tool
             return _todo_tool(
@@ -6269,7 +6356,22 @@ class AIAgent:
             return result
         elif self._memory_manager and self._memory_manager.has_tool(function_name):
             return self._memory_manager.handle_tool_call(function_name, function_args)
+        elif function_name == "ask_decision":
+            durable_result = self._invoke_durable_decision(function_name, function_args)
+            if durable_result is not None:
+                return durable_result
+            from tools.ask_decision_tool import ask_decision_tool as _ask_decision_tool
+            return _ask_decision_tool(
+                decision_key=function_args.get("decision_key", ""),
+                question=function_args.get("question", ""),
+                answer_type=function_args.get("answer_type", "open_text"),
+                choices=function_args.get("choices"),
+                callback=self.clarify_callback,
+            )
         elif function_name == "clarify":
+            durable_result = self._invoke_durable_decision(function_name, function_args)
+            if durable_result is not None:
+                return durable_result
             from tools.clarify_tool import clarify_tool as _clarify_tool
             return _clarify_tool(
                 question=function_args.get("question", ""),
@@ -6278,7 +6380,7 @@ class AIAgent:
             )
         elif function_name == "delegate_task":
             from tools.delegate_tool import delegate_task as _delegate_task
-            return _delegate_task(
+            result = _delegate_task(
                 goal=function_args.get("goal"),
                 context=function_args.get("context"),
                 toolsets=function_args.get("toolsets"),
@@ -6286,12 +6388,15 @@ class AIAgent:
                 max_iterations=function_args.get("max_iterations"),
                 parent_agent=self,
             )
+            if self.durable_run_context is not None:
+                try:
+                    self.durable_run_context.record_delegate_result(function_args, result)
+                except Exception as exc:
+                    logger.debug("Could not persist delegated result: %s", exc)
+            return result
         else:
-            return handle_function_call(
-                function_name, function_args, effective_task_id,
-                tool_call_id=tool_call_id,
-                session_id=self.session_id or "",
-                enabled_tools=list(self.valid_tool_names) if self.valid_tool_names else None,
+            return self._invoke_effectful_tool(
+                function_name, function_args, effective_task_id, tool_call_id=tool_call_id
             )
 
     def _execute_tool_calls_concurrent(self, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0) -> None:
@@ -6643,13 +6748,33 @@ class AIAgent:
                 tool_duration = time.time() - tool_start_time
                 if self._should_emit_quiet_tool_messages():
                     self._vprint(f"  {_get_cute_tool_message_impl('memory', function_args, tool_duration, result=function_result)}")
+            elif function_name == "ask_decision":
+                durable_result = self._invoke_durable_decision(function_name, function_args)
+                if durable_result is not None:
+                    function_result = durable_result
+                else:
+                    from tools.ask_decision_tool import ask_decision_tool as _ask_decision_tool
+                    function_result = _ask_decision_tool(
+                        decision_key=function_args.get("decision_key", ""),
+                        question=function_args.get("question", ""),
+                        answer_type=function_args.get("answer_type", "open_text"),
+                        choices=function_args.get("choices"),
+                        callback=self.clarify_callback,
+                    )
+                tool_duration = time.time() - tool_start_time
+                if self._should_emit_quiet_tool_messages():
+                    self._vprint(f"  {_get_cute_tool_message_impl('ask_decision', function_args, tool_duration, result=function_result)}")
             elif function_name == "clarify":
-                from tools.clarify_tool import clarify_tool as _clarify_tool
-                function_result = _clarify_tool(
-                    question=function_args.get("question", ""),
-                    choices=function_args.get("choices"),
-                    callback=self.clarify_callback,
-                )
+                durable_result = self._invoke_durable_decision(function_name, function_args)
+                if durable_result is not None:
+                    function_result = durable_result
+                else:
+                    from tools.clarify_tool import clarify_tool as _clarify_tool
+                    function_result = _clarify_tool(
+                        question=function_args.get("question", ""),
+                        choices=function_args.get("choices"),
+                        callback=self.clarify_callback,
+                    )
                 tool_duration = time.time() - tool_start_time
                 if self._should_emit_quiet_tool_messages():
                     self._vprint(f"  {_get_cute_tool_message_impl('clarify', function_args, tool_duration, result=function_result)}")
@@ -6678,6 +6803,11 @@ class AIAgent:
                         parent_agent=self,
                     )
                     _delegate_result = function_result
+                    if self.durable_run_context is not None:
+                        try:
+                            self.durable_run_context.record_delegate_result(function_args, function_result)
+                        except Exception as exc:
+                            logger.debug("Could not persist delegated result: %s", exc)
                 finally:
                     self._delegate_spinner = None
                     tool_duration = time.time() - tool_start_time
@@ -6720,11 +6850,8 @@ class AIAgent:
                     spinner.start()
                 _spinner_result = None
                 try:
-                    function_result = handle_function_call(
-                        function_name, function_args, effective_task_id,
-                        tool_call_id=tool_call.id,
-                        session_id=self.session_id or "",
-                        enabled_tools=list(self.valid_tool_names) if self.valid_tool_names else None,
+                    function_result = self._invoke_effectful_tool(
+                        function_name, function_args, effective_task_id, tool_call_id=tool_call.id
                     )
                     _spinner_result = function_result
                 except Exception as tool_error:
@@ -6739,11 +6866,8 @@ class AIAgent:
                         self._vprint(f"  {cute_msg}")
             else:
                 try:
-                    function_result = handle_function_call(
-                        function_name, function_args, effective_task_id,
-                        tool_call_id=tool_call.id,
-                        session_id=self.session_id or "",
-                        enabled_tools=list(self.valid_tool_names) if self.valid_tool_names else None,
+                    function_result = self._invoke_effectful_tool(
+                        function_name, function_args, effective_task_id, tool_call_id=tool_call.id
                     )
                 except Exception as tool_error:
                     function_result = f"Error executing tool '{function_name}': {tool_error}"

@@ -353,6 +353,66 @@ def test_host_hotkey_uses_modifier_chord(monkeypatch):
     assert captured["args"][-3:] == ["kd:cmd,shift", "t:s", "ku:cmd,shift"]
 
 
+
+
+def test_host_browser_window_screenshot_uses_sck_capture(monkeypatch, tmp_path):
+    import tools.host_bridge as host_bridge
+
+    monkeypatch.setattr(host_bridge, "HOST_BRIDGE_DIR", tmp_path / "state")
+
+    def _fake_capture(app, target):
+        Path(target).write_bytes(b"png")
+        return {"ok": True, "stdout": "OK", "stderr": "", "exit_code": 0}
+
+    monkeypatch.setattr(host_bridge, "_capture_browser_window_with_sck", _fake_capture)
+
+    result = host_bridge.host_browser_window_screenshot(str(tmp_path / "shot.png"))
+
+    assert result["ok"] is True
+    assert result["bytes"] == 3
+    assert result["path"].endswith("shot.png")
+
+
+
+
+def test_host_browser_window_screenshot_surfaces_tcc_denial(monkeypatch, tmp_path):
+    import tools.host_bridge as host_bridge
+
+    monkeypatch.setattr(host_bridge, "HOST_BRIDGE_DIR", tmp_path / "state")
+    monkeypatch.setattr(
+        host_bridge,
+        "_capture_browser_window_with_sck",
+        lambda app, target: {
+            "ok": False,
+            "blocked": True,
+            "blocked_reason": "macOS ScreenCaptureKit permission denied for application/window/display capture",
+        },
+    )
+
+    result = host_bridge.host_browser_window_screenshot(str(tmp_path / "shot.png"))
+
+    assert result["ok"] is False
+    assert result["blocked"] is True
+    assert "ScreenCaptureKit permission denied" in result["blocked_reason"]
+
+def test_host_ui_snapshot_includes_browser_window_screenshot(monkeypatch):
+    import tools.host_bridge as host_bridge
+
+    monkeypatch.setattr(
+        host_bridge,
+        "host_applescript",
+        lambda *args, **kwargs: {"ok": True, "stdout": "Google Chrome\n"},
+    )
+    monkeypatch.setattr(host_bridge, "host_cursor_position", lambda: {"ok": True, "x": 1, "y": 2})
+    monkeypatch.setattr(host_bridge, "host_screenshot", lambda path=None: {"ok": True, "path": "/tmp/screen.png", "bytes": 123})
+    monkeypatch.setattr(host_bridge, "host_browser_tab_info", lambda: {"ok": True, "title": "Example Domain"})
+    monkeypatch.setattr(host_bridge, "host_browser_window_screenshot", lambda path=None, app="Google Chrome": {"ok": True, "path": "/tmp/browser.png", "bytes": 55})
+
+    result = host_bridge.host_ui_snapshot()
+
+    assert result["ok"] is True
+    assert result["browser_window_screenshot"]["path"] == "/tmp/browser.png"
+
 def test_host_ui_snapshot_includes_browser_tab_when_chrome_frontmost(monkeypatch):
     import tools.host_bridge as host_bridge
 
@@ -390,3 +450,76 @@ def test_host_gui_doctor_summarizes_gui_checks(monkeypatch):
     assert result["summary"]["accessibility_granted"] is True
     assert result["summary"]["click_ok"] is True
     assert result["summary"]["type_ok"] is True
+
+
+
+def test_host_type_preserves_blank_lines_without_empty_cliclick_commands(monkeypatch):
+    import tools.host_bridge as host_bridge
+
+    monkeypatch.setattr(host_bridge, "_resolve_cliclick_path", lambda: Path("/tmp/cliclick"))
+    captured = {}
+
+    def _fake_run(args, **kwargs):
+        captured["args"] = args
+        return {"ok": True, "stdout": "", "stderr": "", "exit_code": 0}
+
+    monkeypatch.setattr(host_bridge, "_run_host_args", _fake_run)
+
+    result = host_bridge.host_type("line1\n\nline3")
+
+    assert result["ok"] is True
+    assert captured["args"][-4:] == ["t:line1", "kp:return", "kp:return", "t:line3"]
+
+
+def test_host_paste_restores_clipboard(monkeypatch):
+    import tools.host_bridge as host_bridge
+
+    clipboard = {"value": "before"}
+    monkeypatch.setattr(host_bridge, "_clipboard_read", lambda: clipboard["value"])
+    monkeypatch.setattr(host_bridge, "_clipboard_write", lambda text: clipboard.__setitem__("value", text))
+    monkeypatch.setattr(host_bridge, "host_hotkey", lambda *args, **kwargs: {"ok": True})
+
+    result = host_bridge.host_paste("hello world", preserve_clipboard=True)
+
+    assert result["ok"] is True
+    assert clipboard["value"] == "before"
+
+
+def test_host_browser_x_reply_uses_exact_paste_and_submit(monkeypatch):
+    import tools.host_bridge as host_bridge
+
+    states = [
+        {
+            "ok": True,
+            "value": {
+                "action": "ready",
+                "active": {
+                    "composer": {"center": {"x": 100, "y": 200}},
+                    "button": {"center": {"x": 300, "y": 400}, "disabled": "false"},
+                    "current_text": "",
+                },
+            },
+        },
+        {
+            "ok": True,
+            "value": {
+                "action": "ready",
+                "active": {
+                    "composer": {"center": {"x": 100, "y": 200}},
+                    "button": {"center": {"x": 300, "y": 400}, "disabled": "false"},
+                    "current_text": "exact reply",
+                },
+            },
+        },
+    ]
+    monkeypatch.setattr(host_bridge, "host_open_url", lambda *args, **kwargs: {"ok": True})
+    monkeypatch.setattr(host_bridge, "_host_browser_eval_json", lambda *args, **kwargs: states.pop(0))
+    monkeypatch.setattr(host_bridge, "host_click", lambda *args, **kwargs: {"ok": True})
+    monkeypatch.setattr(host_bridge, "host_hotkey", lambda *args, **kwargs: {"ok": True})
+    monkeypatch.setattr(host_bridge, "host_press_key", lambda *args, **kwargs: {"ok": True})
+    monkeypatch.setattr(host_bridge, "host_paste", lambda *args, **kwargs: {"ok": True})
+
+    result = host_bridge.host_browser_x_reply("https://x.com/example/status/123", "exact reply", submit=True)
+
+    assert result["ok"] is True
+    assert result["submitted"] is True
