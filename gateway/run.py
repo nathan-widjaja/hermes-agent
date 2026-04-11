@@ -28,6 +28,15 @@ from pathlib import Path
 from datetime import datetime
 from typing import Dict, Optional, Any, List
 
+from gateway.artifact_verifier import verify_local_image
+from durable_runs import (
+    DurableRunContext,
+    DurableRunDB,
+    decide_admission,
+    format_run_markdown,
+    normalize_workflow_name,
+)
+
 # ---------------------------------------------------------------------------
 # SSL certificate auto-detection for NixOS and other non-standard systems.
 # Must run BEFORE any HTTP library (discord, aiohttp, etc.) is imported.
@@ -530,10 +539,12 @@ class GatewayRunner:
         # Track platforms that failed to connect for background reconnection.
         # Key: Platform enum, Value: {"config": platform_config, "attempts": int, "next_retry": float}
         self._failed_platforms: Dict[Platform, Dict[str, Any]] = {}
+        self._async_loop = None
 
         # Track pending /update prompt responses per session.
         # Key: session_key, Value: True when a prompt is waiting for user input.
         self._update_prompt_pending: Dict[str, bool] = {}
+        self._clarify_waiters: Dict[str, Any] = {}
 
         # Persistent Honcho managers keyed by gateway session key.
         # This preserves write_frequency="session" semantics across short-lived
@@ -555,6 +566,12 @@ class GatewayRunner:
             self._session_db = SessionDB()
         except Exception as e:
             logger.debug("SQLite session store not available: %s", e)
+
+        self._durable_run_db = None
+        try:
+            self._durable_run_db = DurableRunDB()
+        except Exception as e:
+            logger.debug("Durable Runs store not available: %s", e)
         
         # DM pairing store for code-based user authorization
         from gateway.pairing import PairingStore
@@ -779,6 +796,130 @@ class GatewayRunner:
             group_sessions_per_user=getattr(config, "group_sessions_per_user", True),
             thread_sessions_per_user=getattr(config, "thread_sessions_per_user", False),
         )
+
+    def _get_active_durable_run(self, session_entry=None, source: Optional[SessionSource] = None) -> Optional[dict]:
+        db = getattr(self, "_durable_run_db", None)
+        if db is None:
+            return None
+        try:
+            return db.get_latest_active_run(
+                session_id=getattr(session_entry, "session_id", None),
+                source_platform=(source.platform.value if source and source.platform else None),
+                source_chat_id=(source.chat_id if source else None),
+                user_id=(source.user_id if source else None),
+            )
+        except Exception as exc:
+            logger.debug("Could not load active Durable Run: %s", exc)
+            return None
+
+    def _claimant_for_session(self, session_key: Optional[str]) -> str:
+        return f"gateway:{os.getpid()}:{session_key or 'unknown'}"
+
+    def _admit_or_resume_durable_run(
+        self,
+        *,
+        session_entry,
+        source: SessionSource,
+        session_key: Optional[str],
+        message: str,
+        config_dict: Optional[dict] = None,
+    ) -> Optional[DurableRunContext]:
+        db = getattr(self, "_durable_run_db", None)
+        if db is None:
+            return None
+        claimant = self._claimant_for_session(session_key)
+        run = self._get_active_durable_run(session_entry, source)
+        try:
+            if run and db.claim_run(run["run_id"], claimant):
+                claimed = db.get_run(run["run_id"]) or run
+                return DurableRunContext(db, claimed, claimant=claimant)
+        except Exception as exc:
+            logger.debug("Could not reclaim Durable Run %s: %s", run.get("run_id") if run else "?", exc)
+
+        cfg = config_dict or _load_gateway_config()
+        execution_cfg = ((cfg or {}).get("execution_spine") or {})
+        if execution_cfg.get("force_off"):
+            return None
+        admission = decide_admission(message, cfg)
+        if execution_cfg.get("force_on"):
+            admission = type(admission)(True, "force", max(admission.score, 1.0), admission.reasons or ["force_on"], "forced on")
+        if not admission.admitted:
+            return None
+        run = db.create_run(
+            session_id=getattr(session_entry, "session_id", None),
+            workflow_name=normalize_workflow_name(message),
+            source_platform=source.platform.value if source.platform else "unknown",
+            source_chat_id=source.chat_id,
+            user_id=source.user_id,
+            request_text=message,
+            admission=admission,
+            claimant=claimant,
+            metadata={
+                "session_key": session_key,
+                "gateway_platform": source.platform.value if source.platform else None,
+            },
+            lease_seconds=int(execution_cfg.get("lease_seconds", 90) or 90),
+        )
+        return DurableRunContext(db, run, claimant=claimant)
+
+    def _queue_durable_update(self, run_id: str, *, text: str, source_message_id: Optional[str] = None) -> Optional[dict]:
+        db = getattr(self, "_durable_run_db", None)
+        if db is None:
+            return None
+        try:
+            return db.queue_update(
+                run_id,
+                raw_text=text,
+                classification="mid_run_update",
+                source_message_id=source_message_id,
+            )
+        except Exception as exc:
+            logger.debug("Could not queue Durable Run update: %s", exc)
+            return None
+
+    def _gateway_clarify_callback(
+        self,
+        *,
+        session_key: str,
+        source: SessionSource,
+        question: str,
+        choices: Optional[list[str]],
+        metadata: Optional[dict] = None,
+    ) -> str:
+        import queue as _queue
+
+        adapter = self.adapters.get(source.platform)
+        if adapter is None:
+            raise RuntimeError("Adapter unavailable for clarify callback")
+
+        lines = ["❓ Hermes needs your input", "", question]
+        if choices:
+            for idx, choice in enumerate(choices, 1):
+                lines.append(f"{idx}. {choice}")
+            lines.append("")
+            lines.append("Reply with the number or your answer.")
+        prompt = "\n".join(lines)
+        response_queue: _queue.Queue[str] = _queue.Queue(maxsize=1)
+        waiter = {
+            "question": question,
+            "choices": list(choices or []),
+            "queue": response_queue,
+            "metadata": metadata or {},
+        }
+        self._clarify_waiters[session_key] = waiter
+        metadata_out = {"thread_id": source.thread_id} if getattr(source, "thread_id", None) else None
+        loop = getattr(self, "_async_loop", None)
+        if loop is None:
+            raise RuntimeError("Gateway event loop not available for clarify callback")
+        asyncio.run_coroutine_threadsafe(
+            adapter.send(source.chat_id, prompt, metadata=metadata_out),
+            loop,
+        ).result(timeout=15)
+        try:
+            answer = response_queue.get(timeout=86400)
+        finally:
+            self._clarify_waiters.pop(session_key, None)
+        return str(answer or "").strip()
 
     def _resolve_turn_agent_config(self, user_message: str, model: str, runtime_kwargs: dict) -> dict:
         from agent.smart_model_routing import resolve_turn_route
@@ -1836,6 +1977,32 @@ class GatewayRunner:
         # forwarded it to the user; now the user's reply goes back via
         # .update_response so the update process can continue.
         _quick_key = self._session_key_for_source(source)
+        _clarify_waiters = getattr(self, "_clarify_waiters", {})
+        if _quick_key in _clarify_waiters:
+            waiter = _clarify_waiters.get(_quick_key) or {}
+            cmd = event.get_command()
+            if cmd == "status":
+                return await self._handle_status_command(event)
+            if cmd in {"stop", "new", "reset"}:
+                try:
+                    waiter.get("queue").put_nowait("")
+                except Exception:
+                    pass
+                _clarify_waiters.pop(_quick_key, None)
+            elif (event.text or "").strip():
+                raw = (event.text or "").strip()
+                if raw.isdigit():
+                    idx = int(raw) - 1
+                    choices = waiter.get("choices") or []
+                    if 0 <= idx < len(choices):
+                        raw = choices[idx]
+                try:
+                    waiter.get("queue").put_nowait(raw)
+                except Exception:
+                    pass
+                _clarify_waiters.pop(_quick_key, None)
+                return "✓ Got it — continuing the active Durable Run."
+
         _update_prompts = getattr(self, "_update_prompt_pending", {})
         if _update_prompts.get(_quick_key):
             raw = (event.text or "").strip()
@@ -1920,6 +2087,9 @@ class GatewayRunner:
         if _quick_key in self._running_agents:
             if event.get_command() == "status":
                 return await self._handle_status_command(event)
+
+            session_entry = self.session_store.get_or_create_session(source)
+            active_run = self._get_active_durable_run(session_entry, source)
 
             # Resolve the command once for all early-intercept checks below.
             from hermes_cli.commands import resolve_command as _resolve_cmd_inner
@@ -2014,6 +2184,15 @@ class GatewayRunner:
                     else:
                         adapter._pending_messages[_quick_key] = event
                 return None
+
+            if active_run and not _cmd_def_inner and (event.text or "").strip():
+                queued = self._queue_durable_update(
+                    active_run["run_id"],
+                    text=event.text,
+                    source_message_id=event.message_id,
+                )
+                if queued:
+                    return "✓ Queued for the active Durable Run."
 
             running_agent = self._running_agents.get(_quick_key)
             if running_agent is _AGENT_PENDING_SENTINEL:
@@ -3381,6 +3560,20 @@ class GatewayRunner:
         """Handle /status command."""
         source = event.source
         session_entry = self.session_store.get_or_create_session(source)
+        active_run = self._get_active_durable_run(session_entry, source)
+        if active_run and getattr(self, "_durable_run_db", None) is not None:
+            try:
+                payload = self._durable_run_db.inspect_run(active_run["run_id"])
+                durable_lines = format_run_markdown(
+                    payload["run"],
+                    decisions=payload["decisions"],
+                    updates=payload["updates"],
+                    effects=payload["effects"],
+                )
+            except Exception:
+                durable_lines = format_run_markdown(active_run)
+        else:
+            durable_lines = None
 
         connected_platforms = [p.value for p in self.adapters.keys()]
 
@@ -3410,8 +3603,10 @@ class GatewayRunner:
             "",
             f"**Connected Platforms:** {', '.join(connected_platforms)}",
         ])
-
-        return "\n".join(lines)
+        legacy = "\n".join(lines)
+        if durable_lines:
+            return f"{durable_lines}\n\n{legacy}"
+        return legacy
     
     async def _handle_stop_command(self, event: MessageEvent) -> str:
         """Handle /stop command - interrupt a running agent.
@@ -3425,6 +3620,24 @@ class GatewayRunner:
         source = event.source
         session_entry = self.session_store.get_or_create_session(source)
         session_key = session_entry.session_key
+        active_run = self._get_active_durable_run(session_entry, source)
+        waiter = getattr(self, "_clarify_waiters", {}).pop(session_key, None)
+        if waiter:
+            try:
+                waiter.get("queue").put_nowait("")
+            except Exception:
+                pass
+        if active_run and getattr(self, "_durable_run_db", None) is not None:
+            try:
+                self._durable_run_db.update_run(
+                    active_run["run_id"],
+                    status="cancelled",
+                    current_blocker="Stopped by user.",
+                    next_action="Execution cancelled.",
+                    completed=True,
+                )
+            except Exception as exc:
+                logger.debug("Could not cancel Durable Run %s: %s", active_run["run_id"], exc)
         
         agent = self._running_agents.get(session_key)
         if agent is _AGENT_PENDING_SENTINEL:
@@ -4422,6 +4635,24 @@ class GatewayRunner:
                             metadata=_thread_meta,
                         )
                     elif ext in _IMAGE_EXTS:
+                        verification = verify_local_image(media_path, event.text, response)
+                        if not verification.allowed:
+                            logger.warning(
+                                "[%s] Blocking post-stream image %s (%s)",
+                                adapter.name,
+                                media_path,
+                                verification.reason,
+                            )
+                            await adapter.send(
+                                chat_id=event.source.chat_id,
+                                content=(
+                                    "⚠️ I blocked an image because it did not verify as the requested screenshot/proof. "
+                                    "I need to recapture the correct artifact before sending it."
+                                ),
+                                reply_to=event.message_id,
+                                metadata=_thread_meta,
+                            )
+                            continue
                         await adapter.send_image_file(
                             chat_id=event.source.chat_id,
                             image_path=media_path,
@@ -4440,6 +4671,24 @@ class GatewayRunner:
                 try:
                     ext = Path(file_path).suffix.lower()
                     if ext in _IMAGE_EXTS:
+                        verification = verify_local_image(file_path, event.text, response)
+                        if not verification.allowed:
+                            logger.warning(
+                                "[%s] Blocking post-stream local image %s (%s)",
+                                adapter.name,
+                                file_path,
+                                verification.reason,
+                            )
+                            await adapter.send(
+                                chat_id=event.source.chat_id,
+                                content=(
+                                    "⚠️ I blocked an image because it did not verify as the requested screenshot/proof. "
+                                    "I need to recapture the correct artifact before sending it."
+                                ),
+                                reply_to=event.message_id,
+                                metadata=_thread_meta,
+                            )
+                            continue
                         await adapter.send_image_file(
                             chat_id=event.source.chat_id,
                             image_path=file_path,
@@ -6315,6 +6564,7 @@ class GatewayRunner:
         """
         from run_agent import AIAgent
         import queue
+        self._async_loop = asyncio.get_event_loop()
         
         user_config = _load_gateway_config()
         platform_key = _platform_config_key(source.platform)
@@ -6564,6 +6814,7 @@ class GatewayRunner:
         result_holder = [None]  # Mutable container for the result
         tools_holder = [None]   # Mutable container for the tool definitions
         stream_consumer_holder = [None]  # Mutable container for stream consumer
+        durable_context_holder = [None]
         
         # Bridge sync step_callback → async hooks.emit for agent:step events
         _loop_for_step = asyncio.get_event_loop()
@@ -6693,6 +6944,15 @@ class GatewayRunner:
                     logger.debug("Could not set up stream consumer: %s", _sc_err)
 
             turn_route = self._resolve_turn_agent_config(message, model, runtime_kwargs)
+            session_entry = self.session_store.get_or_create_session(source)
+            durable_context = self._admit_or_resume_durable_run(
+                session_entry=session_entry,
+                source=source,
+                session_key=session_key,
+                message=message,
+                config_dict=user_config,
+            )
+            durable_context_holder[0] = durable_context
 
             # Check agent cache — reuse the AIAgent from the previous message
             # in this session to preserve the frozen system prompt and tool
@@ -6749,6 +7009,16 @@ class GatewayRunner:
             agent.stream_delta_callback = _stream_delta_cb
             agent.status_callback = _status_callback_sync
             agent.reasoning_config = reasoning_config
+            agent.durable_run_context = durable_context
+            agent.clarify_callback = (
+                lambda question, choices=None, meta=None: self._gateway_clarify_callback(
+                    session_key=session_key or session_id,
+                    source=source,
+                    question=question,
+                    choices=choices,
+                    metadata=meta,
+                )
+            )
 
             # Background review delivery — send "💾 Memory updated" etc. to user
             def _bg_review_send(message: str) -> None:
@@ -6927,6 +7197,23 @@ class GatewayRunner:
                 unregister_gateway_notify(_approval_session_key)
                 reset_current_session_key(_approval_session_token)
             result_holder[0] = result
+            if durable_context is not None:
+                try:
+                    if result.get("interrupted"):
+                        durable_context.finalize(status="cancelled", error="Interrupted by user.")
+                    elif result.get("failed") or result.get("error"):
+                        durable_context.finalize(
+                            status="failed",
+                            final_response=result.get("final_response"),
+                            error=result.get("error") or result.get("final_response"),
+                        )
+                    else:
+                        durable_context.finalize(
+                            status="completed",
+                            final_response=result.get("final_response"),
+                        )
+                except Exception as exc:
+                    logger.debug("Durable Run finalization failed: %s", exc)
 
             # Signal the stream consumer that the agent is done
             if _stream_consumer is not None:
@@ -7272,6 +7559,16 @@ class GatewayRunner:
                     "history_offset": 0,
                     "failed": True,
                 }
+                durable_ctx = durable_context_holder[0]
+                if durable_ctx is not None:
+                    try:
+                        durable_ctx.finalize(
+                            status="failed",
+                            final_response=response["final_response"],
+                            error="Gateway inactivity timeout",
+                        )
+                    except Exception:
+                        pass
 
             # Track fallback model state: if the agent switched to a
             # fallback model during this run, persist it so /model shows
@@ -7336,6 +7633,16 @@ class GatewayRunner:
                 # even makes its first API call (this was causing an infinite loop).
                 if adapter and hasattr(adapter, '_active_sessions') and session_key and session_key in adapter._active_sessions:
                     adapter._active_sessions[session_key].clear()
+
+                durable_ctx = durable_context_holder[0]
+                if durable_ctx is not None:
+                    queued = self._queue_durable_update(
+                        durable_ctx.run_id,
+                        text=pending,
+                        source_message_id=event_message_id,
+                    )
+                    if queued:
+                        return result_holder[0] or {"final_response": response, "messages": history}
                 
                 # Cap recursion depth to prevent resource exhaustion when the
                 # user sends multiple messages while the agent keeps failing. (#816)

@@ -167,6 +167,27 @@ class TestTelegramSendImageFile:
         call_kwargs = adapter._bot.send_photo.call_args.kwargs
         assert call_kwargs["message_thread_id"] == 789
 
+    def test_oversize_photo_falls_back_to_document(self, adapter, tmp_path):
+        """Oversized local images should be delivered as Telegram documents, not path text."""
+        img = tmp_path / "huge.png"
+        img.write_bytes(b"\x89PNG" + b"\x00" * 50)
+
+        adapter._bot.send_photo = AsyncMock(side_effect=Exception(
+            "File of size 12903718 bytes is too big for a photo; the maximum size is 10485760 bytes"
+        ))
+        mock_doc_msg = MagicMock()
+        mock_doc_msg.message_id = 77
+        adapter._bot.send_document = AsyncMock(return_value=mock_doc_msg)
+
+        result = _run(
+            adapter.send_image_file(chat_id="12345", image_path=str(img))
+        )
+
+        assert result.success
+        assert result.message_id == "77"
+        adapter._bot.send_photo.assert_awaited_once()
+        adapter._bot.send_document.assert_awaited_once()
+
 
 # ---------------------------------------------------------------------------
 # Discord send_image_file tests

@@ -11,6 +11,7 @@ from tools.host_bridge import (
     host_applescript,
     host_browser_attach,
     host_browser_status,
+    host_browser_x_reply,
     host_click,
     host_cursor_position,
     host_double_click,
@@ -24,6 +25,7 @@ from tools.host_bridge import (
     host_gui_doctor,
     host_hotkey,
     host_keystroke,
+    host_paste,
     host_list_dir,
     host_move_mouse,
     host_open_url,
@@ -31,6 +33,7 @@ from tools.host_bridge import (
     host_press_key,
     host_read_path,
     host_screenshot,
+    host_browser_window_screenshot,
     host_service_control,
     host_service_status,
     host_tail_path,
@@ -149,6 +152,17 @@ def host_type_tool(text: str, app: str | None = None, wait_ms: int = 80) -> dict
 
 
 @mcp.tool()
+def host_paste_tool(
+    text: str,
+    app: str | None = None,
+    wait_ms: int = 80,
+    preserve_clipboard: bool = True,
+) -> dict:
+    """Paste exact text into the foreground Mac app using the system clipboard."""
+    return host_paste(text, app=app, wait_ms=wait_ms, preserve_clipboard=preserve_clipboard)
+
+
+@mcp.tool()
 def host_press_key_tool(key: str, wait_ms: int = 80) -> dict:
     """Press a special key such as return, tab, or esc in the foreground Mac app."""
     return host_press_key(key, wait_ms=wait_ms)
@@ -236,6 +250,12 @@ def host_screenshot_tool(path: str | None = None, open_preview: bool = False) ->
 
 
 @mcp.tool()
+def host_browser_window_screenshot_tool(path: str | None = None, app: str = "Google Chrome", open_preview: bool = False) -> dict:
+    """Capture only the front browser window from the real Mac host."""
+    return host_browser_window_screenshot(path, app=app, open_preview=open_preview)
+
+
+@mcp.tool()
 def host_service_status_tool(label: str) -> dict:
     """Inspect a user launchd service on the real Mac host."""
     return host_service_status(label)
@@ -285,6 +305,18 @@ def host_browser_attach_tool(
 def host_browser_status_tool(port: int = DEFAULT_PORT) -> dict:
     """Report real-Chrome CDP readiness and current verification state."""
     return host_browser_status(port=port)
+
+
+@mcp.tool()
+def host_browser_x_reply_tool(
+    tweet_url: str,
+    text: str,
+    app: str = "Google Chrome",
+    submit: bool = False,
+    wait_ms: int = 120,
+) -> dict:
+    """Compose an exact X reply in the correct reply surface, with optional submit."""
+    return host_browser_x_reply(tweet_url, text, app=app, submit=submit, wait_ms=wait_ms)
 
 
 if __name__ == "__main__":

@@ -2647,6 +2647,12 @@ def cmd_doctor(args):
     run_doctor(args)
 
 
+def cmd_runs(args):
+    """Manage Durable Runs."""
+    from hermes_cli.runs import runs_command
+    runs_command(args)
+
+
 def cmd_dump(args):
     """Dump setup summary for support/debugging."""
     from hermes_cli.dump import run_dump
@@ -4619,6 +4625,53 @@ For more help on a command:
         help="Run deep checks (may take longer)"
     )
     status_parser.set_defaults(func=cmd_status)
+
+    # =========================================================================
+    # runs command
+    # =========================================================================
+    runs_parser = subparsers.add_parser(
+        "runs",
+        help="Inspect and control Durable Runs",
+        description="List, inspect, resume, stop, and doctor Durable Runs",
+    )
+    runs_subparsers = runs_parser.add_subparsers(dest="runs_command")
+
+    runs_list = runs_subparsers.add_parser("list", help="List Durable Runs")
+    runs_list.add_argument("--limit", type=int, default=20, help="Maximum number of runs to show")
+
+    runs_show = runs_subparsers.add_parser("show", help="Show one Durable Run")
+    runs_show.add_argument("run_id", nargs="?", help="Run ID to show")
+    runs_show.add_argument("--latest", action="store_true", help="Show the latest run")
+
+    runs_inspect = runs_subparsers.add_parser("inspect", help="Inspect one Durable Run")
+    runs_inspect.add_argument("run_id", nargs="?", help="Run ID to inspect")
+    runs_inspect.add_argument("--latest", action="store_true", help="Inspect the latest run")
+    runs_inspect.add_argument("--json", action="store_true", help="Print full JSON payload")
+
+    runs_resume = runs_subparsers.add_parser("resume", help="Resume or answer a Durable Run")
+    runs_resume.add_argument("run_id", nargs="?", help="Run ID to resume")
+    runs_resume.add_argument("--latest", action="store_true", help="Resume the latest run")
+    runs_resume.add_argument("--answer", help="Answer the latest pending decision")
+    runs_resume.add_argument("--message", help="Queue an operator update for the run")
+    runs_resume.add_argument("--source-message-id", help="Optional source message ID for auditing")
+
+    runs_stop = runs_subparsers.add_parser("stop", help="Cancel a Durable Run")
+    runs_stop.add_argument("run_id", nargs="?", help="Run ID to stop")
+    runs_stop.add_argument("--latest", action="store_true", help="Stop the latest run")
+
+    runs_doctor = runs_subparsers.add_parser("doctor", help="Check Durable Runs database health")
+    runs_doctor.add_argument("--dry-run", action="store_true", help="Show what doctor would do")
+    runs_doctor.add_argument(
+        "--rollback",
+        nargs="?",
+        const="",
+        default=None,
+        help="Restore the latest backup, or provide a specific backup path",
+    )
+    runs_doctor.add_argument("--db-path", type=Path, default=None, help="Override the execution DB path")
+
+    runs_subparsers.add_parser("demo", help="Create a local hello-world Durable Run")
+    runs_parser.set_defaults(func=cmd_runs)
     
     # =========================================================================
     # cron command
